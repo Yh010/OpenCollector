@@ -1,9 +1,16 @@
 import "dotenv/config";
 import { createServer } from "node:http";
+import { resolve } from "node:path";
+import { RawEventSegmentWriter } from "./raw-events/RawEventSegmentWriter.js";
 import { parseTelemetryBatch } from "./telemetry/validateTelemetryBatch.js";
 
 const port = parsePort(process.env.PORT);
 const maxRequestBytes = 1_000_000;
+const rawEventWriter = new RawEventSegmentWriter({
+    rootDirectory: resolve(process.env.RAW_EVENTS_DIR ?? "data/raw-events"),
+    maxSegmentBytes: parsePositiveInteger(process.env.RAW_EVENT_SEGMENT_MAX_BYTES, 128 * 1024 * 1024),
+    segmentIntervalMs: parsePositiveInteger(process.env.RAW_EVENT_SEGMENT_INTERVAL_MS, 5 * 60 * 1000),
+});
 
 const server = createServer(async (request, response) => {
     if (request.method !== "POST" || request.url !== "/v1/telemetry/events") {
@@ -22,12 +29,18 @@ const server = createServer(async (request, response) => {
             return;
         }
 
-        console.log({
+        const storedBatch = await rawEventWriter.write(batch.events);
+
+        console.dir({
             event: "telemetry_batch_accepted",
             eventCount: batch.events.length,
+            batchId: storedBatch.batchId,
+            filePath: storedBatch.filePath,
         });
 
-        response.writeHead(202).end();
+        response.writeHead(202, { "Content-Type": "application/json" }).end(
+            JSON.stringify({ batchId: storedBatch.batchId }),
+        );
     } catch (error) {
         const statusCode = error instanceof RequestTooLargeError ? 413 : 400;
         response.writeHead(statusCode, { "Content-Type": "application/json" }).end(
@@ -46,6 +59,15 @@ function parsePort(value: string | undefined): number {
         throw new Error("PORT must be an integer between 1 and 65535");
     }
     return port;
+}
+
+function parsePositiveInteger(value: string | undefined, defaultValue: number): number {
+    const parsedValue = Number(value ?? defaultValue);
+    if (!Number.isInteger(parsedValue) || parsedValue < 1) {
+        throw new Error("Expected a positive integer configuration value");
+    }
+
+    return parsedValue;
 }
 
 async function readJsonBody(request: import("node:http").IncomingMessage, maxBytes: number): Promise<unknown> {
