@@ -5,11 +5,15 @@
   "type": "module",
   "scripts": {
     "dev": "tsx src/index.ts",
+    "worker": "node scripts/start-worker.cjs",
     "build": "tsc",
     "start": "node dist/index.js"
   },
   "dependencies": {
-    "dotenv": "^17.4.2"
+    "bullmq": "^6.1.1",
+    "dotenv": "^17.4.2",
+    "ioredis": "^6.0.0",
+    "undici": "^6.28.0"
   },
   "devDependencies": {
     "@types/node": "^26.1.1",

@@ -4,13 +4,16 @@ OpenCollector is the telemetry ingestion service for OpenKode.
 
 ## Current scope
 
-`POST /v1/telemetry/events` accepts a JSON body containing an `events` array, validates the raw event shape, logs the accepted batch, and responds with `202 Accepted`.
+`POST /v1/telemetry/events` validates a batch, writes it to durable raw JSONL storage, and queues it in BullMQ. A separate worker normalizes queued batches and writes them to ClickHouse.
 
-This first milestone does not persist events. Durable raw-event storage, workers, ClickHouse, and dashboards come later.
+`GET /v1/telemetry/runs/:runId` returns the run's ordered events and trace tree. It intentionally excludes captured LLM payload metadata until API authentication is implemented.
 
 ## Run locally
 
-1. Copy `.env.example` to `.env` and set `PORT` if required.
+1. Copy `.env.example` to `.env` and configure Redis and ClickHouse.
 2. Install dependencies with `pnpm install`.
 3. Run `pnpm dev`.
-4. Set OpenKode's `OPENKODE_TELEMETRY_COLLECTOR_URL` to `http://localhost:3000/v1/telemetry/events`.
+4. In another terminal, run `pnpm worker`.
+5. Set OpenKode's `OPENKODE_TELEMETRY_COLLECTOR_URL` to `http://localhost:3000/v1/telemetry/events`.
+
+If your network requires an HTTPS proxy to reach ClickHouse Cloud, set `NODE_USE_ENV_PROXY=1` and `HTTPS_PROXY` before starting the collector or worker.

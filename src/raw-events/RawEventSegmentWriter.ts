@@ -2,6 +2,7 @@ import { appendFile, mkdir, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import type { TelemetryEvent } from "../telemetry/TelemetryEvent.js";
+import type { RawTelemetryBatch } from "./RawTelemetryBatch.js";
 
 export interface RawEventSegmentWriterOptions {
     rootDirectory: string;
@@ -28,7 +29,12 @@ export class RawEventSegmentWriter {
 
     write(events: TelemetryEvent[]): Promise<StoredRawBatch> {
         const batchId = randomUUID();
-        const line = `${JSON.stringify({ batchId, receivedAt: new Date().toISOString(), events })}\n`;
+        const rawBatch: RawTelemetryBatch = {
+            batchId,
+            receivedAt: new Date().toISOString(),
+            events,
+        };
+        const line = `${JSON.stringify(rawBatch)}\n`;
         const lineBytes = Buffer.byteLength(line);
 
         const result = this.writeTail.then(async () => {
