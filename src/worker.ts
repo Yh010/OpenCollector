@@ -8,7 +8,7 @@ import type { RawEventBatchJob } from "./queue/RawEventQueue.js";
 import { rawEventQueueName } from "./queue/queueName.js";
 import { RawTelemetryBatchReader } from "./raw-events/RawTelemetryBatchReader.js";
 
-const httpsProxy = process.env.HTTPS_PROXY?.trim();
+const httpsProxy = process.env.OPENCOLLECTOR_HTTPS_PROXY?.trim();
 if (httpsProxy) {
     setGlobalDispatcher(new ProxyAgent(httpsProxy));
 }

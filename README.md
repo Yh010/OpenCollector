@@ -16,4 +16,4 @@ OpenCollector is the telemetry ingestion service for OpenKode.
 4. In another terminal, run `pnpm worker`.
 5. Set OpenKode's `OPENKODE_TELEMETRY_COLLECTOR_URL` to `http://localhost:3000/v1/telemetry/events`.
 
-If your network requires an HTTPS proxy to reach ClickHouse Cloud, set `NODE_USE_ENV_PROXY=1` and `HTTPS_PROXY` before starting the collector or worker.
+If OpenCollector must use an HTTPS proxy to reach ClickHouse Cloud, set `OPENCOLLECTOR_HTTPS_PROXY` in `.env`. Corporate `HTTP_PROXY` and `HTTPS_PROXY` settings are intentionally ignored.
