@@ -1,7 +1,10 @@
 import "dotenv/config";
 import { createServer } from "node:http";
 import { resolve } from "node:path";
-import { buildTraceTree, ClickHouseTelemetryReader } from "./processed-events/ClickHouseTelemetryReader.js";
+import { buildTraceTree, llmAnalytics, overview, runSummaries, spanBreakdown, timeSeries, workerBreakdown } from "./storage/TelemetryAnalytics.js";
+import { JsonlTelemetryStorage } from "./storage/JsonlTelemetryStorage.js";
+import { createTelemetryWorkbook } from "./storage/ExcelExport.js";
+import type { TelemetryQuery } from "./storage/TelemetryStorage.js";
 import { RawEventSegmentWriter } from "./raw-events/RawEventSegmentWriter.js";
 import { RawEventQueue } from "./queue/RawEventQueue.js";
 import { parseTelemetryBatch } from "./telemetry/validateTelemetryBatch.js";
@@ -14,30 +17,27 @@ const rawEventWriter = new RawEventSegmentWriter({
     segmentIntervalMs: parsePositiveInteger(process.env.RAW_EVENT_SEGMENT_INTERVAL_MS, 5 * 60 * 1000),
 });
 const rawEventQueue = new RawEventQueue(process.env.REDIS_URL ?? "redis://127.0.0.1:6379");
-const clickHouseTelemetryReader = new ClickHouseTelemetryReader({
-    url: requireEnvironmentVariable("CLICKHOUSE_URL"),
-    username: requireEnvironmentVariable("CLICKHOUSE_USERNAME"),
-    password: requireEnvironmentVariable("CLICKHOUSE_PASSWORD"),
-    database: requireEnvironmentVariable("CLICKHOUSE_DATABASE"),
-});
+const storage = new JsonlTelemetryStorage(resolve(process.env.NORMALIZED_EVENTS_DIR ?? "data/normalized-events"));
+const dashboardOrigin = process.env.DASHBOARD_ORIGIN ?? "http://localhost:5173";
 
 const server = createServer(async (request, response) => {
-    const requestUrl = new URL(request.url ?? "/", "http://localhost");
-    const runId = getRunId(requestUrl.pathname);
-
-    if (request.method === "GET" && runId) {
-        try {
-            const events = await clickHouseTelemetryReader.getRunEvents(runId);
-            response.writeHead(200, { "Content-Type": "application/json" }).end(
-                JSON.stringify({ runId, events, trace: buildTraceTree(events) }),
-            );
-        } catch (error) {
-            console.error("[OpenCollector] Failed to read telemetry run.", error);
-            response.writeHead(502, { "Content-Type": "application/json" }).end(
-                JSON.stringify({ error: "Telemetry run could not be read" }),
-            );
-        }
+    response.setHeader("Access-Control-Allow-Origin", dashboardOrigin);
+    response.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+    response.setHeader("Access-Control-Allow-Headers", "Content-Type");
+    if (request.method === "OPTIONS") {
+        response.writeHead(204).end();
         return;
+    }
+    const requestUrl = new URL(request.url ?? "/", "http://localhost");
+
+    if (request.method === "GET") {
+        try {
+            if (await handleRead(requestUrl, response)) return;
+        } catch (error) {
+            console.error("[OpenCollector] Failed to read telemetry.", error);
+            response.writeHead(500, { "Content-Type": "application/json" }).end(JSON.stringify({ error: "Telemetry data could not be read" }));
+            return;
+        }
     }
 
     if (request.method !== "POST" || requestUrl.pathname !== "/v1/telemetry/events") {
@@ -85,12 +85,62 @@ const server = createServer(async (request, response) => {
     }
 });
 
-server.listen(port, () => {
-    console.log(`[OpenCollector] Listening on http://localhost:${port}`);
+server.listen(port, "127.0.0.1", () => {
+    console.log(`[OpenCollector] Listening on http://127.0.0.1:${port}`);
 });
 
 process.once("SIGINT", shutdown);
 process.once("SIGTERM", shutdown);
+
+async function handleRead(url: URL, response: import("node:http").ServerResponse): Promise<boolean> {
+    const query = parseQuery(url.searchParams);
+    if (url.pathname === "/v1/telemetry/export.xlsx") {
+        const workbook = await createTelemetryWorkbook(await storage.listEvents(query));
+        response.writeHead(200, { "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "Content-Disposition": "attachment; filename=opencollector-telemetry.xlsx" }).end(workbook);
+        return true;
+    }
+    if (url.pathname === "/v1/telemetry/traces") {
+        const runs = runSummaries(await storage.listEvents(withoutStatus(query))).filter((run) => !query.status || run.status === query.status);
+        const page = parsePositiveInteger(url.searchParams.get("page") ?? undefined, 1);
+        const limit = Math.min(parsePositiveInteger(url.searchParams.get("limit") ?? undefined, 50), 200);
+        response.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ items: runs.slice((page - 1) * limit, page * limit), page, limit, total: runs.length }));
+        return true;
+    }
+    const runId = getRunId(url.pathname);
+    if (runId) {
+        const events = await storage.listEvents({ runId });
+        response.writeHead(events.length ? 200 : 404, { "Content-Type": "application/json" }).end(JSON.stringify(events.length ? { runId, events, trace: buildTraceTree(events) } : { error: "Trace not found" }));
+        return true;
+    }
+    const events = await storage.listEvents(query);
+    const analytics = url.pathname === "/v1/telemetry/analytics/overview" ? overview(events)
+        : url.pathname === "/v1/telemetry/analytics/timeseries" ? timeSeries(events)
+        : url.pathname === "/v1/telemetry/analytics/spans" ? spanBreakdown(events)
+        : url.pathname === "/v1/telemetry/analytics/workers" ? workerBreakdown(events)
+        : url.pathname === "/v1/telemetry/analytics/llm" ? llmAnalytics(events)
+        : undefined;
+    if (analytics === undefined) return false;
+    response.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify(analytics));
+    return true;
+}
+
+function withoutStatus(query: TelemetryQuery): TelemetryQuery {
+    const { status: _status, ...remaining } = query;
+    return remaining;
+}
+
+function parseQuery(parameters: URLSearchParams): TelemetryQuery {
+    const status = parameters.get("status");
+    const type = parameters.get("type");
+    return {
+        ...(parameters.get("from") ? { from: parameters.get("from")! } : {}),
+        ...(parameters.get("to") ? { to: parameters.get("to")! } : {}),
+        ...(status === "ok" || status === "error" ? { status } : {}),
+        ...(type ? { type: type as NonNullable<TelemetryQuery["type"]> } : {}),
+        ...(parameters.get("name") ? { name: parameters.get("name")! } : {}),
+        ...(parameters.get("runId") ? { runId: parameters.get("runId")! } : {}),
+    };
+}
 
 async function shutdown(): Promise<void> {
     server.close();
@@ -114,17 +164,8 @@ function parsePositiveInteger(value: string | undefined, defaultValue: number): 
     return parsedValue;
 }
 
-function requireEnvironmentVariable(name: string): string {
-    const value = process.env[name]?.trim();
-    if (!value) {
-        throw new Error(`${name} is required`);
-    }
-
-    return value;
-}
-
 function getRunId(pathname: string): string | undefined {
-    const prefix = "/v1/telemetry/runs/";
+    const prefix = "/v1/telemetry/traces/";
     if (!pathname.startsWith(prefix)) {
         return undefined;
     }

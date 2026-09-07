@@ -1,30 +1,20 @@
 import "dotenv/config";
 import { Worker } from "bullmq";
 import { Redis } from "ioredis";
-import { ProxyAgent, setGlobalDispatcher } from "undici";
-import { ClickHouseTelemetryWriter } from "./processed-events/ClickHouseTelemetryWriter.js";
+import { resolve } from "node:path";
+import { NormalizedEventSegmentWriter } from "./processed-events/NormalizedEventSegmentWriter.js";
 import { normalizeRawTelemetryBatch } from "./processed-events/normalizeRawTelemetryBatch.js";
 import type { RawEventBatchJob } from "./queue/RawEventQueue.js";
 import { rawEventQueueName } from "./queue/queueName.js";
 import { RawTelemetryBatchReader } from "./raw-events/RawTelemetryBatchReader.js";
 
-const httpsProxy = process.env.OPENCOLLECTOR_HTTPS_PROXY?.trim();
-if (httpsProxy) {
-    setGlobalDispatcher(new ProxyAgent(httpsProxy));
-}
-
 const connection = new Redis(process.env.REDIS_URL ?? "redis://127.0.0.1:6379", {
     maxRetriesPerRequest: null,
 });
 const rawBatchReader = new RawTelemetryBatchReader();
-const clickHouseWriter = new ClickHouseTelemetryWriter({
-    url: requireEnvironmentVariable("CLICKHOUSE_URL"),
-    username: requireEnvironmentVariable("CLICKHOUSE_USERNAME"),
-    password: requireEnvironmentVariable("CLICKHOUSE_PASSWORD"),
-    database: requireEnvironmentVariable("CLICKHOUSE_DATABASE"),
+const normalizedEventWriter = new NormalizedEventSegmentWriter({
+    rootDirectory: resolve(process.env.NORMALIZED_EVENTS_DIR ?? "data/normalized-events"),
 });
-
-await clickHouseWriter.initialize();
 
 connection.on("error", (error) => {
     console.error("[OpenCollector worker] Redis connection error", error);
@@ -35,7 +25,11 @@ const worker = new Worker<RawEventBatchJob>(
     async (job) => {
         const rawBatch = await rawBatchReader.read(job.data.filePath, job.data.batchId);
         const normalizedEvents = normalizeRawTelemetryBatch(rawBatch);
-        await clickHouseWriter.write(normalizedEvents);
+        await normalizedEventWriter.write({
+            batchId: rawBatch.batchId,
+            receivedAt: rawBatch.receivedAt,
+            events: normalizedEvents,
+        });
 
         console.dir({
             event: "telemetry_batch_processed",
@@ -46,7 +40,7 @@ const worker = new Worker<RawEventBatchJob>(
         return {
             batchId: rawBatch.batchId,
             eventCount: normalizedEvents.length,
-            destination: "clickhouse",
+            destination: "normalized-jsonl",
         };
     },
     { connection },
@@ -68,13 +62,4 @@ process.once("SIGTERM", shutdown);
 async function shutdown(): Promise<void> {
     await worker.close();
     await connection.quit();
-}
-
-function requireEnvironmentVariable(name: string): string {
-    const value = process.env[name]?.trim();
-    if (!value) {
-        throw new Error(`${name} is required`);
-    }
-
-    return value;
 }

@@ -5,6 +5,16 @@ export type TelemetryEventType =
     | "tool"
     | "error";
 
+export interface LlmTelemetry {
+    provider?: string;
+    model?: string;
+    inputTokens?: number;
+    outputTokens?: number;
+    totalDurationNs?: number;
+    promptEvalDurationNs?: number;
+    evalDurationNs?: number;
+}
+
 export interface TelemetryEvent {
     eventId: string;
     runId: string;
@@ -16,6 +26,7 @@ export interface TelemetryEvent {
     endedAt: string;
     status: "ok" | "error";
     metadata?: Record<string, unknown>;
+    llm?: LlmTelemetry;
 }
 
 export interface TelemetryBatch {

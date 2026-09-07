@@ -7,13 +7,15 @@
     "dev": "tsx src/index.ts",
     "worker": "node scripts/start-worker.cjs",
     "build": "tsc",
-    "start": "node dist/index.js"
+    "start": "node dist/index.js",
+    "rebuild-normalized": "node dist/rebuild.js",
+    "test": "tsx --test src/storage/TelemetryAnalytics.test.ts"
   },
   "dependencies": {
     "bullmq": "^6.1.1",
     "dotenv": "^17.4.2",
-    "ioredis": "^6.0.0",
-    "undici": "^6.28.0"
+    "exceljs": "^4.4.0",
+    "ioredis": "^6.0.0"
   },
   "devDependencies": {
     "@types/node": "^26.1.1",

@@ -47,6 +47,10 @@ function parseTelemetryEvent(value: unknown): TelemetryEvent | undefined {
         return undefined;
     }
 
+    if (value.llm !== undefined && !isLlmTelemetry(value.llm)) {
+        return undefined;
+    }
+
     return value as unknown as TelemetryEvent;
 }
 
@@ -56,4 +60,12 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function isNonEmptyString(value: unknown): value is string {
     return typeof value === "string" && value.trim().length > 0;
+}
+
+function isLlmTelemetry(value: unknown): boolean {
+    if (!isRecord(value)) return false;
+    const stringFields = ["provider", "model"];
+    const numberFields = ["inputTokens", "outputTokens", "totalDurationNs", "promptEvalDurationNs", "evalDurationNs"];
+    return stringFields.every((field) => value[field] === undefined || isNonEmptyString(value[field]))
+        && numberFields.every((field) => value[field] === undefined || (typeof value[field] === "number" && Number.isFinite(value[field]) && value[field] >= 0));
 }
