@@ -1,8 +1,17 @@
 import ExcelJS from "exceljs";
 import type { NormalizedTelemetryEvent } from "../processed-events/NormalizedTelemetryEvent.js";
+import type { TraceSummary } from "./TelemetryAnalytics.js";
 
-export async function createTelemetryWorkbook(events: NormalizedTelemetryEvent[]): Promise<Buffer> {
+export async function createTelemetryWorkbook(events: NormalizedTelemetryEvent[], runs: TraceSummary[] = []): Promise<Buffer> {
     const workbook = new ExcelJS.Workbook();
+    if (runs.length) {
+        const runSheet = workbook.addWorksheet("Traces");
+        runSheet.columns = [{ header: "Run ID", key: "runId", width: 40 }, { header: "Started at", key: "startedAt", width: 28 }, { header: "Ended at", key: "endedAt", width: 28 }, { header: "Duration ms", key: "durationMs", width: 14 }, { header: "Status", key: "status", width: 12 }, { header: "Span count", key: "spanCount", width: 14 }];
+        runs.forEach((run) => runSheet.addRow(run));
+        runSheet.getRow(1).font = { bold: true };
+        runSheet.views = [{ state: "frozen", ySplit: 1 }];
+        runSheet.autoFilter = { from: "A1", to: "F1" };
+    }
     const sheet = workbook.addWorksheet("Telemetry events");
     sheet.columns = [
         { header: "Event ID", key: "eventId", width: 40 }, { header: "Run ID", key: "runId", width: 40 },

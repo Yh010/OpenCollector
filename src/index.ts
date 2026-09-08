@@ -95,7 +95,13 @@ process.once("SIGTERM", shutdown);
 async function handleRead(url: URL, response: import("node:http").ServerResponse): Promise<boolean> {
     const query = parseQuery(url.searchParams);
     if (url.pathname === "/v1/telemetry/export.xlsx") {
-        const workbook = await createTelemetryWorkbook(await storage.listEvents(query));
+        const filteredEvents = await storage.listEvents(withoutStatus(query));
+        const runs = runSummaries(filteredEvents).filter((run) => !query.status || run.status === query.status);
+        const matchingRunIds = new Set(runs.map((run) => run.runId));
+        const exportEvents = matchingRunIds.size
+            ? (await storage.listEvents({ ...(query.from ? { from: query.from } : {}), ...(query.to ? { to: query.to } : {}) })).filter((event) => matchingRunIds.has(event.runId))
+            : await storage.listEvents(query);
+        const workbook = await createTelemetryWorkbook(exportEvents, runs);
         response.writeHead(200, { "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "Content-Disposition": "attachment; filename=opencollector-telemetry.xlsx" }).end(workbook);
         return true;
     }
