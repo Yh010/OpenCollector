@@ -1,4 +1,5 @@
 import "dotenv/config";
+import { OverviewStore } from "./overview/OverviewStore.js";
 import { Worker } from "bullmq";
 import { Redis } from "ioredis";
 import { resolve } from "node:path";
@@ -12,9 +13,10 @@ const connection = new Redis(process.env.REDIS_URL ?? "redis://127.0.0.1:6379", 
     maxRetriesPerRequest: null,
 });
 const rawBatchReader = new RawTelemetryBatchReader();
-const normalizedEventWriter = new NormalizedEventSegmentWriter({
-    rootDirectory: resolve(process.env.NORMALIZED_EVENTS_DIR ?? "data/normalized-events"),
-});
+const normalizedRoot = resolve(process.env.NORMALIZED_EVENTS_DIR ?? "data/normalized-events");
+const overviewStore = new OverviewStore(normalizedRoot);
+await overviewStore.rebuild();
+const normalizedEventWriter = new NormalizedEventSegmentWriter({ rootDirectory: normalizedRoot, overview: overviewStore });
 
 connection.on("error", (error) => {
     console.error("[OpenCollector worker] Redis connection error", error);
@@ -61,5 +63,6 @@ process.once("SIGTERM", shutdown);
 
 async function shutdown(): Promise<void> {
     await worker.close();
+    normalizedEventWriter.close();
     await connection.quit();
 }

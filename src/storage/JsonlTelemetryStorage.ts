@@ -3,18 +3,27 @@ import { join } from "node:path";
 import type { NormalizedTelemetryBatch } from "../processed-events/NormalizedEventSegmentWriter.js";
 import type { NormalizedTelemetryEvent } from "../processed-events/NormalizedTelemetryEvent.js";
 import type { TelemetryStorage, TelemetryQuery } from "./TelemetryStorage.js";
+import { ReadTimings } from "../performance/ReadTimings.js";
 
 export class JsonlTelemetryStorage implements TelemetryStorage {
     constructor(private readonly rootDirectory: string) {}
 
-    async listEvents(query: TelemetryQuery): Promise<NormalizedTelemetryEvent[]> {
+    async listEvents(query: TelemetryQuery, timings?: ReadTimings): Promise<NormalizedTelemetryEvent[]> {
+        const discoverStart = performance.now();
         const files = await this.segmentFiles(this.rootDirectory);
+        timings?.add("discover", performance.now() - discoverStart);
+        if (timings) timings.fileCount += files.length;
         const events: NormalizedTelemetryEvent[] = [];
         for (const file of files) {
-            const batch = await this.readBatch(file);
-            if (batch) events.push(...batch.events.filter((event) => matches(event, query)));
+            const batch = await this.readBatch(file, timings);
+            if (batch) {
+                if (timings) timings.eventCount += batch.events.length;
+                const append = () => events.push(...batch.events.filter((event) => matches(event, query)));
+                if (timings) timings.measure("filter", append); else append();
+            }
         }
-        return events.sort((left, right) => left.startedAt.localeCompare(right.startedAt) || left.spanId.localeCompare(right.spanId));
+        const sort = () => events.sort((left, right) => left.startedAt.localeCompare(right.startedAt) || left.spanId.localeCompare(right.spanId));
+        return timings ? timings.measure("sort", sort) : sort();
     }
 
     private async segmentFiles(directory: string): Promise<string[]> {
@@ -32,10 +41,17 @@ export class JsonlTelemetryStorage implements TelemetryStorage {
         return nested.flat();
     }
 
-    private async readBatch(filePath: string): Promise<NormalizedTelemetryBatch | undefined> {
+    private async readBatch(filePath: string, timings?: ReadTimings): Promise<NormalizedTelemetryBatch | undefined> {
         try {
-            const value: unknown = JSON.parse((await readFile(filePath, "utf8")).trim());
-            return isNormalizedBatch(value) ? value : undefined;
+            const readStart = performance.now();
+            let content: string;
+            try { content = await readFile(filePath, "utf8"); }
+            finally { timings?.add("read", performance.now() - readStart); }
+            const parse = () => {
+                const value: unknown = JSON.parse(content.trim());
+                return isNormalizedBatch(value) ? value : undefined;
+            };
+            return timings ? timings.measure("parse", parse) : parse();
         } catch {
             return undefined;
         }

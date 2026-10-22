@@ -26,8 +26,10 @@ export function buildTraceTree(events: NormalizedTelemetryEvent[]): TraceNode[] 
     return roots;
 }
 
-export function summarizeRuns(events: NormalizedTelemetryEvent[]): TraceSummary[] {
-    const groups = new Map<string, NormalizedTelemetryEvent[]>();
+type RunEvent = Pick<NormalizedTelemetryEvent, "runId" | "startedAt" | "endedAt" | "status">;
+
+export function summarizeRuns(events: RunEvent[]): TraceSummary[] {
+    const groups = new Map<string, RunEvent[]>();
     for (const event of events) groups.set(event.runId, [...(groups.get(event.runId) ?? []), event]);
     return [...groups.entries()].map(([runId, values]) => {
         const startedAt = values.reduce((value, event) => value < event.startedAt ? value : event.startedAt, values[0]!.startedAt);
@@ -71,19 +73,21 @@ export function workerBreakdown(events: NormalizedTelemetryEvent[]) {
     return [...grouped.entries()].map(([worker, values]) => ({ worker, executions: values.length, errors: values.filter((event) => event.status === "error").length, averageLatencyMs: Math.round(values.reduce((sum, event) => sum + event.durationMs, 0) / values.length), p50LatencyMs: percentile(values.map((event) => event.durationMs), 50), p95LatencyMs: percentile(values.map((event) => event.durationMs), 95), maxLatencyMs: Math.max(...values.map((event) => event.durationMs)) })).sort((left, right) => right.p95LatencyMs - left.p95LatencyMs);
 }
 
-export function runSummaries(events: NormalizedTelemetryEvent[]): TraceSummary[] {
+export function runSummaries(events: (RunEvent & Pick<NormalizedTelemetryEvent, "type" | "name">)[]): TraceSummary[] {
     return summarizeRuns(events.filter(isRootRun));
 }
 
-function isRootRun(event: NormalizedTelemetryEvent): boolean {
+function isRootRun(event: Pick<NormalizedTelemetryEvent, "type" | "name">): boolean {
     return event.type === "run" && event.name === "openKode-run";
 }
 
-export function spanBreakdown(events: NormalizedTelemetryEvent[]) {
-    const grouped = new Map<string, NormalizedTelemetryEvent[]>();
+export function spanBreakdown(events: Pick<NormalizedTelemetryEvent, "type" | "name" | "status" | "durationMs">[]) {
+    const grouped = new Map<string, (typeof events)[number][]>();
     for (const event of events) {
         const key = `${event.type}:${event.name}`;
-        grouped.set(key, [...(grouped.get(key) ?? []), event]);
+        const group = grouped.get(key);
+        if (group) group.push(event);
+        else grouped.set(key, [event]);
     }
     return [...grouped.entries()].map(([key, values]) => ({
         key, type: values[0]!.type, name: values[0]!.name, count: values.length,
@@ -93,12 +97,14 @@ export function spanBreakdown(events: NormalizedTelemetryEvent[]) {
     })).sort((left, right) => right.p95DurationMs - left.p95DurationMs);
 }
 
-export function llmAnalytics(events: NormalizedTelemetryEvent[]) {
+export function llmAnalytics(events: Pick<NormalizedTelemetryEvent, "type" | "llm" | "durationMs">[]) {
     const generations = events.filter((event) => event.type === "generation");
-    const grouped = new Map<string, NormalizedTelemetryEvent[]>();
+    const grouped = new Map<string, (typeof events)[number][]>();
     for (const event of generations) {
         const key = `${event.llm?.provider ?? "unknown"}:${event.llm?.model ?? "unknown"}`;
-        grouped.set(key, [...(grouped.get(key) ?? []), event]);
+        const group = grouped.get(key);
+        if (group) group.push(event);
+        else grouped.set(key, [event]);
     }
     return [...grouped.entries()].map(([key, values]) => ({
         key, provider: values[0]!.llm?.provider ?? "unknown", model: values[0]!.llm?.model ?? "unknown", count: values.length,

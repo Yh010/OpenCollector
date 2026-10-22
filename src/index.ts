@@ -1,4 +1,6 @@
 import "dotenv/config";
+import { OverviewStore } from "./overview/OverviewStore.js";
+import { ReadTimings } from "./performance/ReadTimings.js";
 import { createServer } from "node:http";
 import { resolve } from "node:path";
 import { buildTraceTree, llmAnalytics, overview, runSummaries, spanBreakdown, timeSeries, workerBreakdown } from "./storage/TelemetryAnalytics.js";
@@ -17,13 +19,22 @@ const rawEventWriter = new RawEventSegmentWriter({
     segmentIntervalMs: parsePositiveInteger(process.env.RAW_EVENT_SEGMENT_INTERVAL_MS, 5 * 60 * 1000),
 });
 const rawEventQueue = new RawEventQueue(process.env.REDIS_URL ?? "redis://127.0.0.1:6379");
-const storage = new JsonlTelemetryStorage(resolve(process.env.NORMALIZED_EVENTS_DIR ?? "data/normalized-events"));
+const normalizedRoot = resolve(process.env.NORMALIZED_EVENTS_DIR ?? "data/normalized-events");
+const storage = new JsonlTelemetryStorage(normalizedRoot);
+const overviewStore = new OverviewStore(normalizedRoot);
+const precomputedOverviewEnabled = process.env.OVERVIEW_PRECOMPUTED !== "false";
+const precomputedTimeSeriesEnabled = process.env.TIMESERIES_PRECOMPUTED !== "false";
+const precomputedSpansEnabled = process.env.SPANS_PRECOMPUTED !== "false";
+const precomputedLlmEnabled = process.env.LLM_PRECOMPUTED !== "false";
+const precomputedTracesEnabled = process.env.TRACES_PRECOMPUTED !== "false";
 const dashboardOrigin = process.env.DASHBOARD_ORIGIN ?? "http://localhost:5173";
 
 const server = createServer(async (request, response) => {
     response.setHeader("Access-Control-Allow-Origin", dashboardOrigin);
     response.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
     response.setHeader("Access-Control-Allow-Headers", "Content-Type");
+    response.setHeader("Access-Control-Expose-Headers", "Server-Timing, X-Overview-Source, X-Overview-Updated-At, X-Timeseries-Source, X-Timeseries-Updated-At, X-Spans-Source, X-Spans-Updated-At, X-Llm-Source, X-Llm-Updated-At, X-Traces-Source, X-Traces-Updated-At");
+    response.setHeader("Timing-Allow-Origin", dashboardOrigin);
     if (request.method === "OPTIONS") {
         response.writeHead(204).end();
         return;
@@ -31,11 +42,12 @@ const server = createServer(async (request, response) => {
     const requestUrl = new URL(request.url ?? "/", "http://localhost");
 
     if (request.method === "GET") {
+        const timings = new ReadTimings();
         try {
-            if (await handleRead(requestUrl, response)) return;
+            if (await handleRead(requestUrl, response, timings)) return;
         } catch (error) {
             console.error("[OpenCollector] Failed to read telemetry.", error);
-            response.writeHead(500, { "Content-Type": "application/json" }).end(JSON.stringify({ error: "Telemetry data could not be read" }));
+            writeJson(response, 500, { error: "Telemetry data could not be read" }, timings);
             return;
         }
     }
@@ -92,7 +104,7 @@ server.listen(port, "127.0.0.1", () => {
 process.once("SIGINT", shutdown);
 process.once("SIGTERM", shutdown);
 
-async function handleRead(url: URL, response: import("node:http").ServerResponse): Promise<boolean> {
+async function handleRead(url: URL, response: import("node:http").ServerResponse, timings: ReadTimings): Promise<boolean> {
     const query = parseQuery(url.searchParams);
     if (url.pathname === "/v1/telemetry/export.xlsx") {
         const filteredEvents = await storage.listEvents(withoutStatus(query));
@@ -106,28 +118,82 @@ async function handleRead(url: URL, response: import("node:http").ServerResponse
         return true;
     }
     if (url.pathname === "/v1/telemetry/traces") {
-        const runs = runSummaries(await storage.listEvents(withoutStatus(query))).filter((run) => !query.status || run.status === query.status);
-        const page = parsePositiveInteger(url.searchParams.get("page") ?? undefined, 1);
-        const limit = Math.min(parsePositiveInteger(url.searchParams.get("limit") ?? undefined, 50), 200);
-        response.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ items: runs.slice((page - 1) * limit, page * limit), page, limit, total: runs.length }));
+        const snapshot = precomputedTracesEnabled ? timings.measure("summary", () => overviewStore.readTraces(query)) : undefined;
+        if (snapshot) {
+            response.setHeader("X-Traces-Source", "precomputed");
+            response.setHeader("X-Traces-Updated-At", snapshot.updatedAt);
+            writeJson(response, 200, snapshot.result, timings);
+            return true;
+        }
+        response.setHeader("X-Traces-Source", precomputedTracesEnabled ? "live-fallback" : "live-baseline");
+        const events = await storage.listEvents(withoutStatus(query), timings);
+        const runs = timings.measure("compute", () => runSummaries(events).filter((run) => !query.status || run.status === query.status));
+        writeJson(response, 200, { items: runs, total: runs.length }, timings);
         return true;
     }
     const runId = getRunId(url.pathname);
     if (runId) {
-        const events = await storage.listEvents({ runId });
-        response.writeHead(events.length ? 200 : 404, { "Content-Type": "application/json" }).end(JSON.stringify(events.length ? { runId, events, trace: buildTraceTree(events) } : { error: "Trace not found" }));
+        const events = await storage.listEvents({ runId }, timings);
+        const result = timings.measure("compute", () => events.length ? { runId, events, trace: buildTraceTree(events) } : { error: "Trace not found" });
+        writeJson(response, events.length ? 200 : 404, result, timings);
         return true;
     }
-    const events = await storage.listEvents(query);
-    const analytics = url.pathname === "/v1/telemetry/analytics/overview" ? overview(events)
+    if (url.pathname === "/v1/telemetry/analytics/overview") {
+        const snapshot = precomputedOverviewEnabled ? timings.measure("summary", () => overviewStore.read(query)) : undefined;
+        if (snapshot) {
+            response.setHeader("X-Overview-Source", "precomputed");
+            response.setHeader("X-Overview-Updated-At", snapshot.updatedAt);
+            writeJson(response, 200, snapshot.result, timings);
+            return true;
+        }
+        // Preserve correct responses before the initial background rebuild completes.
+        response.setHeader("X-Overview-Source", precomputedOverviewEnabled ? "live-fallback" : "live-baseline");
+    }
+    if (url.pathname === "/v1/telemetry/analytics/timeseries") {
+        const snapshot = precomputedTimeSeriesEnabled ? timings.measure("summary", () => overviewStore.readTimeSeries(query)) : undefined;
+        if (snapshot) {
+            response.setHeader("X-Timeseries-Source", "precomputed");
+            response.setHeader("X-Timeseries-Updated-At", snapshot.updatedAt);
+            writeJson(response, 200, snapshot.result, timings);
+            return true;
+        }
+        response.setHeader("X-Timeseries-Source", precomputedTimeSeriesEnabled ? "live-fallback" : "live-baseline");
+    }
+    if (url.pathname === "/v1/telemetry/analytics/spans") {
+        const snapshot = precomputedSpansEnabled ? timings.measure("summary", () => overviewStore.readSpans(query)) : undefined;
+        if (snapshot) {
+            response.setHeader("X-Spans-Source", "precomputed");
+            response.setHeader("X-Spans-Updated-At", snapshot.updatedAt);
+            writeJson(response, 200, snapshot.result, timings);
+            return true;
+        }
+        response.setHeader("X-Spans-Source", precomputedSpansEnabled ? "live-fallback" : "live-baseline");
+    }
+    if (url.pathname === "/v1/telemetry/analytics/llm") {
+        const snapshot = precomputedLlmEnabled ? timings.measure("summary", () => overviewStore.readLlm(query)) : undefined;
+        if (snapshot) {
+            response.setHeader("X-Llm-Source", "precomputed");
+            response.setHeader("X-Llm-Updated-At", snapshot.updatedAt);
+            writeJson(response, 200, snapshot.result, timings);
+            return true;
+        }
+        response.setHeader("X-Llm-Source", precomputedLlmEnabled ? "live-fallback" : "live-baseline");
+    }
+    const events = await storage.listEvents(query, timings);
+    const analytics = timings.measure("compute", () => url.pathname === "/v1/telemetry/analytics/overview" ? overview(events)
         : url.pathname === "/v1/telemetry/analytics/timeseries" ? timeSeries(events)
         : url.pathname === "/v1/telemetry/analytics/spans" ? spanBreakdown(events)
         : url.pathname === "/v1/telemetry/analytics/workers" ? workerBreakdown(events)
         : url.pathname === "/v1/telemetry/analytics/llm" ? llmAnalytics(events)
-        : undefined;
+        : undefined);
     if (analytics === undefined) return false;
-    response.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify(analytics));
+    writeJson(response, 200, analytics, timings);
     return true;
+}
+
+function writeJson(response: import("node:http").ServerResponse, status: number, value: unknown, timings: ReadTimings): void {
+    const body = timings.measure("serialize", () => JSON.stringify(value));
+    response.writeHead(status, { "Content-Type": "application/json", "Server-Timing": timings.header() }).end(body);
 }
 
 function withoutStatus(query: TelemetryQuery): TelemetryQuery {
@@ -149,7 +215,7 @@ function parseQuery(parameters: URLSearchParams): TelemetryQuery {
 }
 
 async function shutdown(): Promise<void> {
-    server.close();
+    server.close(() => overviewStore.close());
     await rawEventQueue.close();
 }
 

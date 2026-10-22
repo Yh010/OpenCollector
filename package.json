@@ -9,7 +9,17 @@
     "build": "tsc",
     "start": "node dist/index.js",
     "rebuild-normalized": "node dist/rebuild.js",
-    "test": "tsx --test src/storage/TelemetryAnalytics.test.ts"
+    "test": "tsx --test src/storage/TelemetryAnalytics.test.ts",
+    "perf:seed": "node scripts/perf-data.mjs seed",
+    "perf:clean": "node scripts/perf-data.mjs remove",
+    "test:timings": "tsx --test src/performance/ReadTimings.test.ts",
+    "perf:measure": "node scripts/measure-read-api.mjs",
+    "overview:rebuild": "tsx src/overview/rebuild.ts",
+    "test:traces": "tsx --test src/overview/TracesStore.test.ts src/overview/TracesApi.test.ts",
+    "test:llm": "tsx --test src/overview/LlmStore.test.ts src/overview/LlmApi.test.ts",
+    "test:spans": "tsx --test src/overview/SpansStore.test.ts src/overview/SpansApi.test.ts",
+    "test:timeseries": "tsx --test src/overview/TimeSeriesStore.test.ts src/overview/TimeSeriesApi.test.ts",
+    "test:overview": "tsx --test src/overview/OverviewStore.test.ts src/overview/OverviewApi.test.ts"
   },
   "dependencies": {
     "bullmq": "^6.1.1",
@@ -21,5 +31,8 @@
     "@types/node": "^26.1.1",
     "tsx": "^4.23.1",
     "typescript": "^7.0.2"
+  },
+  "engines": {
+    "node": ">=24"
   }
 }
