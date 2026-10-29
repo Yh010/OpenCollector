@@ -15,11 +15,13 @@
     "test:timings": "tsx --test src/performance/ReadTimings.test.ts",
     "perf:measure": "node scripts/measure-read-api.mjs",
     "overview:rebuild": "tsx src/overview/rebuild.ts",
+    "test:trace-detail": "tsx --test src/storage/IndexedTraceDetail.test.ts",
     "test:traces": "tsx --test src/overview/TracesStore.test.ts src/overview/TracesApi.test.ts",
     "test:llm": "tsx --test src/overview/LlmStore.test.ts src/overview/LlmApi.test.ts",
     "test:spans": "tsx --test src/overview/SpansStore.test.ts src/overview/SpansApi.test.ts",
     "test:timeseries": "tsx --test src/overview/TimeSeriesStore.test.ts src/overview/TimeSeriesApi.test.ts",
-    "test:overview": "tsx --test src/overview/OverviewStore.test.ts src/overview/OverviewApi.test.ts"
+    "test:overview": "tsx --test src/overview/OverviewStore.test.ts src/overview/OverviewApi.test.ts",
+    "test:analysis": "tsx --test src/analysis/TraceAnalysis.test.ts"
   },
   "dependencies": {
     "bullmq": "^6.1.1",

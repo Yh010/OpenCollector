@@ -140,3 +140,64 @@ test("trace list returns all rows and preserves newest-first ordering and equal-
         assert.equal(actual.items.length, 1001);
     });
 });
+
+
+test("cursor pages traverse ties and every filter without duplicates or missing runs", async () => {
+    await fixture(async (root, store, writer) => {
+        await store.rebuild();
+        await writer.write(batch("many", Array.from({ length: 123 }, (_, i) => event(i))));
+        await writer.write(batch("split", [event(999, { runId: "r1", status: "error" })]));
+        const raw = new JsonlTelemetryStorage(root);
+        for (const query of [{}, { status: "error" as const }, { status: "ok" as const },
+            { from: "2026-10-22" }, { to: "2026-10-21T23:59:59Z" }, { type: "run" as const },
+            { type: "generation" as const }, { name: "openKode-run" }, { name: "missing" }, { runId: "r1" },
+            { from: "2026-10-21", status: "error" as const }, { runId: "missing" }]) {
+            const expected = (await original(raw, query)).items.sort((a, b) => Buffer.compare(Buffer.from(b.startedAt), Buffer.from(a.startedAt)) || Buffer.compare(Buffer.from(b.runId), Buffer.from(a.runId)));
+            const collected: typeof expected = [];
+            let cursor: string | undefined;
+            let pages = 0;
+            do {
+                const page = store.readTracePage(query, { limit: 7, ...(cursor ? { cursor } : {}) })!.result;
+                assert.equal(page.total, expected.length);
+                assert.ok(page.items.length <= 7);
+                collected.push(...page.items);
+                cursor = page.nextCursor ?? undefined;
+                assert.ok(++pages < 30);
+            } while (cursor);
+            assert.deepEqual(collected, expected, JSON.stringify(query));
+            assert.equal(new Set(collected.map(run => run.runId)).size, collected.length);
+            for (const pageNumber of new Set([1, Math.max(1, Math.ceil(expected.length / 7)), Math.max(1, Math.ceil(expected.length / 14))])) {
+                const jumped = store.readTracePage(query, { limit: 7, page: pageNumber })!.result;
+                assert.deepEqual(jumped.items, expected.slice((pageNumber - 1) * 7, pageNumber * 7));
+                if (jumped.cursor) assert.deepEqual(store.readTracePage(query, { limit: 7, cursor: jumped.cursor })!.result.items, jumped.items);
+            }
+            assert.throws(() => store.readTracePage(query, { limit: 7, page: Math.max(1, Math.ceil(expected.length / 7)) + 1 }));
+        }
+    });
+});
+
+test("cursor validation, index readiness and newer inserts preserve the page boundary", async () => {
+    await fixture(async (root, store, writer) => {
+        assert.equal(store.readTracePage({}, { limit: 5 }), undefined);
+        await store.rebuild();
+        await writer.write(batch("a", Array.from({ length: 21 }, (_, i) => event(i))));
+        const first = store.readTracePage({}, { limit: 5 })!.result;
+        const cursor = first.nextCursor!;
+        const second = store.readTracePage({}, { limit: 5, cursor })!.result;
+        for (const limit of [0, 201, 1.5, NaN]) assert.throws(() => store.readTracePage({}, { limit }));
+        assert.throws(() => store.readTracePage({}, { limit: 5, cursor: "garbage" }));
+        assert.throws(() => store.readTracePage({ status: "error" }, { limit: 5, cursor }));
+        assert.throws(() => store.readTracePage({}, { limit: 6, cursor }));
+        await writer.write(batch("new", [event(50, { startedAt: "2026-10-23T00:00:00.000Z" })]));
+        assert.deepEqual(store.readTracePage({}, { limit: 5, cursor })!.result.items, second.items);
+        const before = store.readTracePage({}, { limit: 5 });
+        const malformed = { ...event(99), name: undefined } as unknown as NormalizedTelemetryEvent;
+        assert.throws(() => store.applyBatch(join(root, "bad.jsonl"), batch("bad", [malformed])));
+        assert.deepEqual(store.readTracePage({}, { limit: 5 }), before);
+        const db = new DatabaseSync(join(root, ".overview.sqlite"));
+        try { db.exec("DELETE FROM trace_pages_state"); } finally { db.close(); }
+        assert.equal(store.readTracePage({}, { limit: 5 }), undefined);
+        await store.rebuild();
+        assert.equal(store.readTracePage({}, { limit: 5 })!.result.total, 22);
+    });
+});

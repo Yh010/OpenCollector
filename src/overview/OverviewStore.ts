@@ -7,6 +7,8 @@ import type { NormalizedTelemetryBatch } from "../processed-events/NormalizedEve
 import type { NormalizedTelemetryEvent } from "../processed-events/NormalizedTelemetryEvent.js";
 import { llmAnalytics, runSummaries, spanBreakdown } from "../storage/TelemetryAnalytics.js";
 import type { overview, timeSeries } from "../storage/TelemetryAnalytics.js";
+import { decodeTraceCursor, encodeTraceCursor, InvalidTracePageError } from "./TracePagination.js";
+import type { TracePageOptions } from "./TracePagination.js";
 import type { TelemetryQuery } from "../storage/TelemetryStorage.js";
 
 type Overview = ReturnType<typeof overview>;
@@ -14,6 +16,7 @@ type TimeSeries = ReturnType<typeof timeSeries>;
 type Spans = ReturnType<typeof spanBreakdown>;
 type Llm = ReturnType<typeof llmAnalytics>;
 type Traces = { items: ReturnType<typeof runSummaries>; total: number };
+export type TracePage = Traces & { nextCursor: string | null; cursor: string | null; limit: number };
 type ProjectedEvent = Pick<NormalizedTelemetryEvent, "runId" | "type" | "name" | "status" | "startedAt" | "endedAt" | "spanId" | "durationMs" | "llm">;
 type Segment = { path: string; digest: string; events: ProjectedEvent[] };
 type State = { ready: number; revision: number; updated_at: string; payload: string };
@@ -76,6 +79,13 @@ export class OverviewStore {
             CREATE TABLE IF NOT EXISTS traces_state (
                 id INTEGER PRIMARY KEY CHECK(id=1), revision INTEGER NOT NULL, payload TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS trace_runs (
+                run_id TEXT PRIMARY KEY, started_at TEXT NOT NULL, ended_at TEXT NOT NULL,
+                status TEXT NOT NULL, span_count INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS trace_runs_order ON trace_runs(started_at DESC, run_id DESC);
+            CREATE INDEX IF NOT EXISTS trace_runs_status_order ON trace_runs(status, started_at DESC, run_id DESC);
+            CREATE TABLE IF NOT EXISTS trace_pages_state (id INTEGER PRIMARY KEY CHECK(id=1), revision INTEGER NOT NULL);
             PRAGMA user_version=1;
         `);
         this.insertEvent = this.db.prepare("INSERT INTO events VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
@@ -131,6 +141,16 @@ export class OverviewStore {
         }, "DEFERRED");
     }
 
+    lookupRunSegments(runId: string): { paths: string[]; updatedAt: string } | undefined {
+        return this.transaction(() => {
+            const state = this.state();
+            if (!state.ready) return undefined;
+            const rows = this.db.prepare(`SELECT DISTINCT segments.path FROM events
+                JOIN segments ON segments.id=events.segment_id WHERE events.run_id=? ORDER BY segments.path`).all(runId);
+            return { paths: rows.map(row => String(row.path)), updatedAt: state.updated_at };
+        }, "DEFERRED");
+    }
+
     readTraces(query: TelemetryQuery): { result: Traces; updatedAt: string } | undefined {
         return this.transaction(() => {
             const state = this.state();
@@ -141,6 +161,53 @@ export class OverviewStore {
             const base = !Object.values(filters).some(Boolean) ? JSON.parse(saved.payload as string) as Traces : this.calculateTraces(filters);
             const items = status ? base.items.filter(run => run.status === status) : base.items;
             return { result: { items, total: items.length }, updatedAt: state.updated_at };
+        }, "DEFERRED");
+    }
+
+    readTracePage(query: TelemetryQuery, options: TracePageOptions): { result: TracePage; updatedAt: string } | undefined {
+        if (!Number.isInteger(options.limit) || options.limit < 1 || options.limit > 200) throw new InvalidTracePageError("limit must be an integer between 1 and 200");
+        if (options.page !== undefined && (!Number.isSafeInteger(options.page) || options.page < 1)) throw new InvalidTracePageError("page must be a positive integer");
+        if (options.page !== undefined && options.cursor !== undefined) throw new InvalidTracePageError("Use either page or cursor, not both");
+        let cursor = decodeTraceCursor(options.cursor, query, options.limit);
+        let pageCursor = options.cursor ?? null;
+        return this.transaction(() => {
+            const state = this.state();
+            if (!state.ready || this.db.prepare("SELECT revision FROM trace_pages_state WHERE id=1").get()?.revision !== state.revision) return undefined;
+            const { status, ...filters } = query;
+            const indexed = !filters.from && !filters.to && !filters.type && !filters.name;
+            const { where, values } = this.predicate(indexed ? (filters.runId ? { runId: filters.runId } : {}) : filters);
+            const source = indexed ? "trace_runs" : `(
+                SELECT run_id, MIN(started_at) AS started_at, MAX(ended_at) AS ended_at,
+                    CASE MAX(CASE WHEN status='error' THEN 1 ELSE 0 END) WHEN 1 THEN 'error' ELSE 'ok' END AS status,
+                    COUNT(*) AS span_count
+                FROM events WHERE ${where} AND type='run' AND name='openKode-run' GROUP BY run_id
+            )`;
+            const clauses = indexed ? [where] : ["1=1"];
+            const params: Array<string | number> = [...values];
+            if (status) { clauses.push("status=?"); params.push(status); }
+            const total = Number(this.db.prepare(`SELECT COUNT(*) AS count FROM ${source} WHERE ${clauses.join(" AND ")}`).get(...params)!.count);
+            if (options.page !== undefined && options.page > Math.max(1, Math.ceil(total / options.limit)))
+                throw new InvalidTracePageError(`page must be between 1 and ${Math.max(1, Math.ceil(total / options.limit))}`);
+            if (options.page !== undefined && options.page > 1) {
+                // Random access needs an index walk to locate the boundary. Normal navigation remains keyset-based.
+                const anchor = this.db.prepare(`SELECT started_at AS startedAt, run_id AS runId FROM ${source}
+                    WHERE ${clauses.join(" AND ")} ORDER BY started_at DESC, run_id DESC LIMIT 1 OFFSET ?`)
+                    .get(...params, (options.page - 1) * options.limit - 1) as unknown as { startedAt: string; runId: string };
+                pageCursor = encodeTraceCursor(anchor, query, options.limit);
+                cursor = decodeTraceCursor(pageCursor, query, options.limit);
+            }
+            if (cursor) { clauses.push("(started_at, run_id) < (?, ?)"); params.push(cursor.startedAt, cursor.runId); }
+            type Row = { runId: string; startedAt: string; endedAt: string; status: "ok" | "error"; spanCount: number };
+            // Fetch one extra row to detect the next page; never load the full list into JS.
+            const rows = this.db.prepare(`SELECT run_id AS runId, started_at AS startedAt, ended_at AS endedAt,
+                status, span_count AS spanCount FROM ${source} WHERE ${clauses.join(" AND ")}
+                ORDER BY started_at DESC, run_id DESC LIMIT ?`).all(...params, options.limit + 1) as unknown as Row[];
+            const hasMore = rows.length > options.limit;
+            if (hasMore) rows.pop();
+            const items = rows.map(row => ({ runId: row.runId, startedAt: row.startedAt, endedAt: row.endedAt,
+                durationMs: Date.parse(row.endedAt) - Date.parse(row.startedAt), status: row.status, spanCount: row.spanCount }));
+            return { result: { items, total, limit: options.limit, cursor: pageCursor,
+                nextCursor: hasMore ? encodeTraceCursor(items[items.length - 1]!, query, options.limit) : null }, updatedAt: state.updated_at };
         }, "DEFERRED");
     }
 
@@ -311,9 +378,16 @@ export class OverviewStore {
             SELECT 1 FROM events LEFT JOIN span_events USING(segment_id, ordinal)
             WHERE type='run' AND name='openKode-run' AND span_events.segment_id IS NULL LIMIT 1
         `).get();
-        if (missingRoots) this.db.exec("DELETE FROM traces_state");
-        else this.db.prepare("INSERT OR REPLACE INTO traces_state VALUES (1, ?, ?)")
-            .run(this.state().revision, JSON.stringify(this.calculateTraces({})));
+        if (missingRoots) this.db.exec("DELETE FROM traces_state; DELETE FROM trace_runs; DELETE FROM trace_pages_state;");
+        else {
+            const traces = this.calculateTraces({});
+            this.db.prepare("INSERT OR REPLACE INTO traces_state VALUES (1, ?, ?)")
+                .run(this.state().revision, JSON.stringify(traces));
+            this.db.exec("DELETE FROM trace_runs;");
+            const insert = this.db.prepare("INSERT INTO trace_runs VALUES (?, ?, ?, ?, ?)");
+            for (const run of traces.items) insert.run(run.runId, run.startedAt, run.endedAt, run.status, run.spanCount);
+            this.db.prepare("INSERT OR REPLACE INTO trace_pages_state VALUES (1, ?)").run(this.state().revision);
+        }
     }
 
     private transaction<T>(operation: () => T, mode: "IMMEDIATE" | "DEFERRED" = "IMMEDIATE"): T {

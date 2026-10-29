@@ -1,4 +1,5 @@
 const descriptions = {
+    index: "Locate trace segment paths in SQLite",
     summary: "Read precomputed analytics / exact filtered projection",
     discover: "Find telemetry files",
     read: "Read file contents (elapsed, includes async wait)",

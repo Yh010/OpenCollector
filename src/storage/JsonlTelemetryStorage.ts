@@ -1,5 +1,5 @@
 import { readdir, readFile } from "node:fs/promises";
-import { join } from "node:path";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { NormalizedTelemetryBatch } from "../processed-events/NormalizedEventSegmentWriter.js";
 import type { NormalizedTelemetryEvent } from "../processed-events/NormalizedTelemetryEvent.js";
 import type { TelemetryStorage, TelemetryQuery } from "./TelemetryStorage.js";
@@ -12,6 +12,22 @@ export class JsonlTelemetryStorage implements TelemetryStorage {
         const discoverStart = performance.now();
         const files = await this.segmentFiles(this.rootDirectory);
         timings?.add("discover", performance.now() - discoverStart);
+        return this.readEvents(query, files, timings);
+    }
+
+    async listRunEvents(runId: string, paths: string[], timings?: ReadTimings): Promise<NormalizedTelemetryEvent[]> {
+        const root = resolve(this.rootDirectory);
+        const files = paths.map(path => {
+            const target = resolve(root, path);
+            const local = relative(root, target);
+            if (isAbsolute(path) || !local || local === ".." || local.startsWith(`..${sep}`) || isAbsolute(local))
+                throw new Error("Indexed segment path must be inside normalized storage");
+            return target;
+        });
+        return this.readEvents({ runId }, files, timings);
+    }
+
+    private async readEvents(query: TelemetryQuery, files: string[], timings?: ReadTimings): Promise<NormalizedTelemetryEvent[]> {
         if (timings) timings.fileCount += files.length;
         const events: NormalizedTelemetryEvent[] = [];
         for (const file of files) {

@@ -1,4 +1,6 @@
 import "dotenv/config";
+import { TraceAnalyzer, TraceAnalysisError } from "./analysis/TraceAnalysis.js";
+import { InvalidTracePageError, parseTracePageOptions } from "./overview/TracePagination.js";
 import { OverviewStore } from "./overview/OverviewStore.js";
 import { ReadTimings } from "./performance/ReadTimings.js";
 import { createServer } from "node:http";
@@ -22,18 +24,14 @@ const rawEventQueue = new RawEventQueue(process.env.REDIS_URL ?? "redis://127.0.
 const normalizedRoot = resolve(process.env.NORMALIZED_EVENTS_DIR ?? "data/normalized-events");
 const storage = new JsonlTelemetryStorage(normalizedRoot);
 const overviewStore = new OverviewStore(normalizedRoot);
-const precomputedOverviewEnabled = process.env.OVERVIEW_PRECOMPUTED !== "false";
-const precomputedTimeSeriesEnabled = process.env.TIMESERIES_PRECOMPUTED !== "false";
-const precomputedSpansEnabled = process.env.SPANS_PRECOMPUTED !== "false";
-const precomputedLlmEnabled = process.env.LLM_PRECOMPUTED !== "false";
-const precomputedTracesEnabled = process.env.TRACES_PRECOMPUTED !== "false";
+const traceAnalyzer = new TraceAnalyzer();
 const dashboardOrigin = process.env.DASHBOARD_ORIGIN ?? "http://localhost:5173";
 
 const server = createServer(async (request, response) => {
     response.setHeader("Access-Control-Allow-Origin", dashboardOrigin);
     response.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
     response.setHeader("Access-Control-Allow-Headers", "Content-Type");
-    response.setHeader("Access-Control-Expose-Headers", "Server-Timing, X-Overview-Source, X-Overview-Updated-At, X-Timeseries-Source, X-Timeseries-Updated-At, X-Spans-Source, X-Spans-Updated-At, X-Llm-Source, X-Llm-Updated-At, X-Traces-Source, X-Traces-Updated-At");
+    response.setHeader("Access-Control-Expose-Headers", "Server-Timing, X-Overview-Source, X-Overview-Updated-At, X-Timeseries-Source, X-Timeseries-Updated-At, X-Spans-Source, X-Spans-Updated-At, X-Llm-Source, X-Llm-Updated-At, X-Traces-Source, X-Traces-Updated-At, X-Trace-Source, X-Trace-Updated-At");
     response.setHeader("Timing-Allow-Origin", dashboardOrigin);
     if (request.method === "OPTIONS") {
         response.writeHead(204).end();
@@ -41,11 +39,41 @@ const server = createServer(async (request, response) => {
     }
     const requestUrl = new URL(request.url ?? "/", "http://localhost");
 
+    if (request.method === "POST" && requestUrl.pathname.startsWith("/v1/telemetry/traces/") && requestUrl.pathname.endsWith("/analyze")) {
+        response.setHeader("Cache-Control", "no-store");
+        if (request.headers.origin && request.headers.origin !== dashboardOrigin) {
+            writeJson(response, 403, { error: "Analysis requests must come from the dashboard" }, new ReadTimings());
+            return;
+        }
+        const controller = new AbortController();
+        const cancel = () => { if (!response.writableEnded) controller.abort(); };
+        response.once("close", cancel);
+        const timings = new ReadTimings();
+        try {
+            const runId = getRunId(requestUrl.pathname.slice(0, -"/analyze".length));
+            if (!runId) { writeJson(response, 400, { error: "Invalid run ID" }, timings); return; }
+            const index = overviewStore.lookupRunSegments(runId);
+            if (!index) { writeJson(response, 503, { error: "Trace index is initializing. Try again shortly." }, timings); return; }
+            const events = await storage.listRunEvents(runId, index.paths, timings);
+            if (!events.length) { writeJson(response, 404, { error: "Trace not found" }, timings); return; }
+            const analysis = await traceAnalyzer.analyze(events, controller.signal);
+            if (!controller.signal.aborted) writeJson(response, 200, analysis, timings);
+        } catch (error) {
+            if (!controller.signal.aborted) writeJson(response, error instanceof TraceAnalysisError ? error.status : 500,
+                { error: error instanceof TraceAnalysisError ? error.message : "Trace analysis could not be completed. Try again." }, timings);
+        } finally { response.off("close", cancel); }
+        return;
+    }
+
     if (request.method === "GET") {
         const timings = new ReadTimings();
         try {
             if (await handleRead(requestUrl, response, timings)) return;
         } catch (error) {
+            if (error instanceof InvalidTracePageError) {
+                writeJson(response, 400, { error: error.message }, timings);
+                return;
+            }
             console.error("[OpenCollector] Failed to read telemetry.", error);
             writeJson(response, 500, { error: "Telemetry data could not be read" }, timings);
             return;
@@ -105,6 +133,18 @@ process.once("SIGINT", shutdown);
 process.once("SIGTERM", shutdown);
 
 async function handleRead(url: URL, response: import("node:http").ServerResponse, timings: ReadTimings): Promise<boolean> {
+    // Comparison mode is available only on local development servers unless explicitly disabled.
+    const baseline = url.searchParams.get("optimizations") === "off";
+    if (baseline && (process.env.NODE_ENV === "production" || process.env.PERFORMANCE_DEMO_ENABLED === "false")) {
+        writeJson(response, 400, { error: "Optimization comparison is disabled on this server" }, timings);
+        return true;
+    }
+    const precomputedOverviewEnabled = !baseline && process.env.OVERVIEW_PRECOMPUTED !== "false";
+    const precomputedTimeSeriesEnabled = !baseline && process.env.TIMESERIES_PRECOMPUTED !== "false";
+    const precomputedSpansEnabled = !baseline && process.env.SPANS_PRECOMPUTED !== "false";
+    const precomputedLlmEnabled = !baseline && process.env.LLM_PRECOMPUTED !== "false";
+    const precomputedTracesEnabled = !baseline && process.env.TRACES_PRECOMPUTED !== "false";
+    const indexedTraceDetailEnabled = !baseline && process.env.TRACE_DETAIL_INDEXED !== "false";
     const query = parseQuery(url.searchParams);
     if (url.pathname === "/v1/telemetry/export.xlsx") {
         const filteredEvents = await storage.listEvents(withoutStatus(query));
@@ -118,14 +158,22 @@ async function handleRead(url: URL, response: import("node:http").ServerResponse
         return true;
     }
     if (url.pathname === "/v1/telemetry/traces") {
-        const snapshot = precomputedTracesEnabled ? timings.measure("summary", () => overviewStore.readTraces(query)) : undefined;
+        const page = parseTracePageOptions(url.searchParams);
+        const snapshot = precomputedTracesEnabled ? timings.measure("summary", () => overviewStore.readTracePage(query, page)) : undefined;
         if (snapshot) {
             response.setHeader("X-Traces-Source", "precomputed");
             response.setHeader("X-Traces-Updated-At", snapshot.updatedAt);
             writeJson(response, 200, snapshot.result, timings);
             return true;
         }
-        response.setHeader("X-Traces-Source", precomputedTracesEnabled ? "live-fallback" : "live-baseline");
+        // Normal pagination requires the index; never scan JSONL while it initializes.
+        if (precomputedTracesEnabled) {
+            response.setHeader("Retry-After", "2");
+            writeJson(response, 503, { error: "Trace index is initializing. Retry after the worker rebuild completes." }, timings);
+            return true;
+        }
+        // Explicit experimental baseline keeps the former full-list behavior.
+        response.setHeader("X-Traces-Source", "live-baseline");
         const events = await storage.listEvents(withoutStatus(query), timings);
         const runs = timings.measure("compute", () => runSummaries(events).filter((run) => !query.status || run.status === query.status));
         writeJson(response, 200, { items: runs, total: runs.length }, timings);
@@ -133,7 +181,15 @@ async function handleRead(url: URL, response: import("node:http").ServerResponse
     }
     const runId = getRunId(url.pathname);
     if (runId) {
-        const events = await storage.listEvents({ runId }, timings);
+        const index = indexedTraceDetailEnabled ? timings.measure("index", () => overviewStore.lookupRunSegments(runId)) : undefined;
+        if (indexedTraceDetailEnabled && !index) {
+            response.setHeader("Retry-After", "2");
+            writeJson(response, 503, { error: "Trace index is initializing. Retry after the worker rebuild completes." }, timings);
+            return true;
+        }
+        response.setHeader("X-Trace-Source", indexedTraceDetailEnabled ? "indexed-jsonl" : "live-baseline");
+        if (index) response.setHeader("X-Trace-Updated-At", index.updatedAt);
+        const events = index ? await storage.listRunEvents(runId, index.paths, timings) : await storage.listEvents({ runId }, timings);
         const result = timings.measure("compute", () => events.length ? { runId, events, trace: buildTraceTree(events) } : { error: "Trace not found" });
         writeJson(response, events.length ? 200 : 404, result, timings);
         return true;
