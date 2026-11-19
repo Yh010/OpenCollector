@@ -16,6 +16,10 @@ export interface LlmTelemetry {
 }
 
 export interface TelemetryEvent {
+    userId?: string;
+    installationId?: string;
+    sessionId?: string;
+    chatId?: string;
     eventId: string;
     runId: string;
     spanId: string;

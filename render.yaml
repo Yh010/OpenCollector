@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: openkode-collector
+    runtime: node
+    plan: free
+    buildCommand: corepack enable && pnpm install --frozen-lockfile --prod=false && pnpm run build
+    startCommand: node dist/cloud.js
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_VERSION
+        value: 24.19.0
+      - key: NODE_ENV
+        value: production
+      - key: SUPABASE_URL
+        value: https://hzrnpjibpbaxjmlbfkeh.supabase.co
+      - key: SUPABASE_PUBLISHABLE_KEY
+        value: sb_publishable_Oz_JF1jdKuCkoox5LnffJw_qBTy6NC8
+      - key: OPENCOLLECTOR_ADMIN_USER_IDS
+        sync: false
+      - key: DASHBOARD_ORIGIN
+        sync: false

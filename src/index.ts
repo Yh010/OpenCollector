@@ -1,4 +1,16 @@
 import "dotenv/config";
+import { Ownership, OwnershipError } from "./auth/Ownership.js";
+import { OperatorAccess } from "./auth/OperatorAccess.js";
+import { setGlobalProxyFromEnv } from "node:http";
+import { getCACertificates, setDefaultCACertificates } from "node:tls";
+if (process.env.HTTPS_PROXY || process.env.HTTP_PROXY) {
+    setDefaultCACertificates([...getCACertificates("default"), ...getCACertificates("system")]);
+    setGlobalProxyFromEnv();
+}
+const ownership = new Ownership(
+    process.env.SUPABASE_URL ?? "https://hzrnpjibpbaxjmlbfkeh.supabase.co",
+    process.env.SUPABASE_PUBLISHABLE_KEY ?? "sb_publishable_Oz_JF1jdKuCkoox5LnffJw_qBTy6NC8",
+);
 import { TraceAnalyzer, TraceAnalysisError } from "./analysis/TraceAnalysis.js";
 import { InvalidTracePageError, parseTracePageOptions } from "./overview/TracePagination.js";
 import { OverviewStore } from "./overview/OverviewStore.js";
@@ -13,6 +25,7 @@ import { RawEventSegmentWriter } from "./raw-events/RawEventSegmentWriter.js";
 import { RawEventQueue } from "./queue/RawEventQueue.js";
 import { parseTelemetryBatch } from "./telemetry/validateTelemetryBatch.js";
 
+const operatorAccess = new OperatorAccess(ownership, process.env.OPENCOLLECTOR_ADMIN_USER_IDS ?? "");
 const port = parsePort(process.env.PORT);
 const maxRequestBytes = 1_000_000;
 const rawEventWriter = new RawEventSegmentWriter({
@@ -25,19 +38,39 @@ const normalizedRoot = resolve(process.env.NORMALIZED_EVENTS_DIR ?? "data/normal
 const storage = new JsonlTelemetryStorage(normalizedRoot);
 const overviewStore = new OverviewStore(normalizedRoot);
 const traceAnalyzer = new TraceAnalyzer();
-const dashboardOrigin = process.env.DASHBOARD_ORIGIN ?? "http://localhost:5173";
+const dashboardOrigin = process.env.DASHBOARD_ORIGIN ?? "http://127.0.0.1:5175";
 
 const server = createServer(async (request, response) => {
     response.setHeader("Access-Control-Allow-Origin", dashboardOrigin);
     response.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-    response.setHeader("Access-Control-Allow-Headers", "Content-Type");
+    response.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
     response.setHeader("Access-Control-Expose-Headers", "Server-Timing, X-Overview-Source, X-Overview-Updated-At, X-Timeseries-Source, X-Timeseries-Updated-At, X-Spans-Source, X-Spans-Updated-At, X-Llm-Source, X-Llm-Updated-At, X-Traces-Source, X-Traces-Updated-At, X-Trace-Source, X-Trace-Updated-At");
     response.setHeader("Timing-Allow-Origin", dashboardOrigin);
     if (request.method === "OPTIONS") {
         response.writeHead(204).end();
         return;
     }
+    response.setHeader("Cache-Control", "no-store");
     const requestUrl = new URL(request.url ?? "/", "http://localhost");
+    if (request.method === "GET" && requestUrl.pathname === "/health") {
+        response.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ status: "ok" }));
+        return;
+    }
+    // Only CLI ingestion is available to ordinary users. All dashboard APIs,
+    // including trace details, exports and AI analysis, share this operator gate.
+    if (!(request.method === "POST" && requestUrl.pathname === "/v1/telemetry/events")) {
+        try {
+            const identity = await operatorAccess.verify(request.headers.authorization);
+            if (request.method === "GET" && requestUrl.pathname === "/v1/auth/me") {
+                response.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify(identity));
+                return;
+            }
+        } catch (error) {
+            const status = error instanceof OwnershipError ? error.status : 503;
+            response.writeHead(status, { "Content-Type": "application/json" }).end(JSON.stringify({ error: error instanceof OwnershipError ? error.message : "Identity service unavailable" }));
+            return;
+        }
+    }
 
     if (request.method === "POST" && requestUrl.pathname.startsWith("/v1/telemetry/traces/") && requestUrl.pathname.endsWith("/analyze")) {
         response.setHeader("Cache-Control", "no-store");
@@ -105,6 +138,7 @@ const server = createServer(async (request, response) => {
     }
 
     try {
+        batch = await ownership.accept(batch, request.headers.authorization);
         const storedBatch = await rawEventWriter.write(batch.events);
         await rawEventQueue.enqueueRawBatch(storedBatch);
 
@@ -118,7 +152,11 @@ const server = createServer(async (request, response) => {
         response.writeHead(202, { "Content-Type": "application/json" }).end(
             JSON.stringify({ batchId: storedBatch.batchId }),
         );
-    } catch {
+    } catch (error) {
+        if (error instanceof OwnershipError) {
+            response.writeHead(error.status, { "Content-Type": "application/json" }).end(JSON.stringify({ error: error.message }));
+            return;
+        }
         response.writeHead(503, { "Content-Type": "application/json" }).end(
             JSON.stringify({ error: "Telemetry batch could not be queued" }),
         );

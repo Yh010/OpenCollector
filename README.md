@@ -120,10 +120,83 @@ Start local Ollama and install `qwen2.5-coder:3b` with `ollama pull qwen2.5-code
 
 Analysis includes timings, types, statuses and span identifiers/names, plus recorded task details, prompts/messages, model responses, code excerpts, errors and tool inputs/outputs from selected spans. Metadata is allowlisted at the top level and recursively bounded/redacted; unrelated fields are omitted. Basic credential-pattern redaction is best-effort, not a guarantee that error messages contain no sensitive text. The complete serialized context is limited to roughly 20,000 characters and at most 60 span summaries, reserving about half the space for payloads. Failed spans, their ancestors and two preceding steps are prioritized, followed by roots and slower spans. Text fields retain bounded beginning/end excerpts (normally 1,600 characters); arrays retain their latest 16 entries, objects up to 24 fields and nesting up to six levels. Output context reports detail-field counts, shortened/redacted/omitted counts and sample notes. Upstream capture truncation is also reported when flagged. Overlapping durations must not be added together. Structured output is validated, including references. Model text is rendered as text, not HTML. No tools are exposed to the model.
 
-One analysis runs at a time per collector process (429 otherwise). There is no application-level generation deadline; the UI can cancel and retry, and leaving the trace aborts its request. Results are held only in the mounted inspector, with no persistent cache or history. Error statuses: 403 for foreign dashboard origins, 404 missing trace, 503 unready index/unavailable local model service, 502 invalid/incomplete model output. Production authentication/rate limits must be supplied before exposing this local collector externally.
+One analysis runs at a time per collector process (429 otherwise). There is no application-level generation deadline; the UI can cancel and retry, and leaving the trace aborts its request. Results are held only in the mounted inspector, with no persistent cache or history. Error statuses: 403 for foreign dashboard origins, 404 missing trace, 503 unready index/unavailable local model service, 502 invalid/incomplete model output. Dashboard authentication is enforced by the shared operator gate; deployment still needs HTTPS and infrastructure rate limits.
 
 When all recorded diagnostic content is absent or the trace is synthetic, `evidenceOnly: true` marks a deterministic summary of statuses and timings; model-generated cause claims are discarded. Synthetic results direct the user to real traces rather than suggest debugging simulated tools.
 
 Prompt/model-response context uses OpenKode's recorded `metadata.llm.inputMessages` and `metadata.llm.output` fields, along with generic prompt/input/output/code/task fields where recorded. `OPENKODE_TELEMETRY_CAPTURE_LLM_CONTENT=true` controls capture in OpenKode for future runs (off by default); the analyzer does not change that policy or reconstruct missing historical content. Tool inputs/outputs and the original task are available only if their emitting span recorded them. Traces without recorded content explicitly report the gap. The model sees trace content as untrusted data, even when it contains system/user messages or instruction-like strings.
 
 Analysis no longer imposes a 650-token generation cap or rejects answers based on done/done_reason flags or a 20,000-character response-size check. It attempts to parse the returned content; valid JSON with the required analysis fields and supported span references is still required. The input-context budget remains. The former 90-second application timeout has been removed; caller cancellation still works.
+
+## Authenticated ingestion ownership
+
+Ingestion requires a Supabase bearer token. The collector verifies identity,
+rejects forged or inconsistent ownership, and registers run ownership through
+`register_telemetry_runs` before saving events. Apply OpenKode migration
+`202611190002_register_runs.sql` first. Only the user token and public project
+key are needed; no service key is used. JSONL normalization preserves the IDs.
+Historical events remain unattributed.
+
+## Dashboard operator access
+
+Every dashboard read, trace detail, Excel export, and AI analysis request requires
+a Supabase bearer token whose verified user ID is in
+`OPENCOLLECTOR_ADMIN_USER_IDS` (comma-separated UUIDs). An empty list denies all
+accounts. Find your UUID with `openkode whoami`; set the list in the collector's
+private `.env`, then restart the API. Never grant access by trusting a user ID
+from a request body, query string, or an unverified decoded JWT.
+
+Ordinary OpenKode users can submit their own verified telemetry without being
+dashboard operators. Operators can inspect the whole dataset, including legacy
+unowned traces. This is an internal console, not a customer-facing trace portal.
+Missing/invalid credentials return 401; verified but unapproved accounts get 403;
+identity-service outages fail closed with 503. Only `/health` and CORS preflight
+are public. Responses are not cached.
+
+The local dashboard runs at `http://127.0.0.1:5175`; `DASHBOARD_ORIGIN` must match.
+Its Google callback allowlist entry is
+`http://127.0.0.1:5175/auth/callback/*` in Supabase. The public project key is
+sufficient; neither a service-role key nor an admin secret is shipped to browsers.
+
+Run `pnpm test` for the complete collector suite. API tests use a localhost HTTPS
+identity fixture and synthetic accounts; the certificate/private key in
+`src/auth/fixtures` are test-only, not production credentials. Keep the collector
+on loopback until HTTPS/reverse-proxy and deployment limits are configured.
+
+## Render free deployment
+
+Hosted mode starts with `pnpm start:cloud` (`node dist/cloud.js`). It binds
+`0.0.0.0:$PORT` and commits each upload to Supabase before returning 202. It
+does not use Redis, SQLite, background workers, or the service filesystem.
+Local mode (`pnpm start` plus `pnpm worker`) keeps its existing JSONL storage.
+
+1. Apply OpenKode's Supabase migrations through `202611190004_validate_stored_events.sql`.
+2. Add the approved operator UUID through the Supabase SQL Editor:
+   `insert into public.collector_operators(user_id) values ('YOUR_USER_UUID');`
+   Clients cannot grant themselves operator access.
+3. Create the free Node web service using `render.yaml`, or build with
+   `pnpm install --frozen-lockfile --prod=false && pnpm run build` and start with
+   `node dist/cloud.js`. Select Node 24.19.0 and health check `/health`.
+4. Set `OPENCOLLECTOR_ADMIN_USER_IDS` to that same UUID and `DASHBOARD_ORIGIN`
+   to the actual Vercel production origin. The public Supabase URL/key are
+   defaults; do not add a service-role key or database password.
+5. Set the dashboard's `VITE_OPENCOLLECTOR_URL` to the Render HTTPS origin,
+   rebuild it, and add its exact `/auth/callback/*` URL to Supabase Auth.
+6. Set OpenKode's `OPENKODE_TELEMETRY_COLLECTOR_URL` to the Render HTTPS URL
+   ending `/v1/telemetry/events`.
+
+All reads require an approved operator JWT. Supabase independently restricts
+event reads to the operator table; ordinary users can execute only the checked
+ingestion function. Identical event IDs/payloads deduplicate; overwrites fail.
+Historical local traces are not uploaded automatically.
+
+This initial hosted reader supports up to 20,000 spans per filtered view. It
+returns an explicit error above that limit instead of silently truncating data.
+Use a shorter date range; database-side analytics will be needed as usage grows.
+Free Render instances sleep when idle, so the first request can be slow. The
+CLI allows 90 seconds for HTTPS uploads and retries transient failures once;
+delivery is still best-effort if the process exits or the outage continues.
+
+Hosted AI trace analysis returns 503 until a hosted model is configured. Viewing
+traces, analytics, and Excel export work without a model. The local AI analysis
+path remains available with local Ollama.

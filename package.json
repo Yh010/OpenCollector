@@ -9,7 +9,7 @@
     "build": "tsc",
     "start": "node dist/index.js",
     "rebuild-normalized": "node dist/rebuild.js",
-    "test": "tsx --test src/storage/TelemetryAnalytics.test.ts",
+    "test": "tsx --test --test-concurrency=3 src/**/*.test.ts",
     "perf:seed": "node scripts/perf-data.mjs seed",
     "perf:clean": "node scripts/perf-data.mjs remove",
     "test:timings": "tsx --test src/performance/ReadTimings.test.ts",
@@ -21,7 +21,8 @@
     "test:spans": "tsx --test src/overview/SpansStore.test.ts src/overview/SpansApi.test.ts",
     "test:timeseries": "tsx --test src/overview/TimeSeriesStore.test.ts src/overview/TimeSeriesApi.test.ts",
     "test:overview": "tsx --test src/overview/OverviewStore.test.ts src/overview/OverviewApi.test.ts",
-    "test:analysis": "tsx --test src/analysis/TraceAnalysis.test.ts"
+    "test:analysis": "tsx --test src/analysis/TraceAnalysis.test.ts",
+    "start:cloud": "node dist/cloud.js"
   },
   "dependencies": {
     "bullmq": "^6.1.1",
@@ -35,6 +36,7 @@
     "typescript": "^7.0.2"
   },
   "engines": {
-    "node": ">=24"
-  }
+    "node": ">=24.14.0"
+  },
+  "packageManager": "pnpm@10.34.5"
 }

@@ -1,3 +1,4 @@
+import { startIdentityFixture, operatorFetch as fetch } from "../auth/testFixtures.js";
 import assert from "node:assert/strict";
 import test from "node:test";
 import { spawn } from "node:child_process";
@@ -25,9 +26,10 @@ test("HTTP llm falls back before readiness, then serves exact filtered snapshots
     assert.ok(address && typeof address !== "string");
     const port = address.port;
     await new Promise<void>((resolve, reject) => reservation.close(error => error ? reject(error) : resolve()));
+    const auth = await startIdentityFixture();
     const child = spawn(process.execPath, ["--import", "tsx", fileURLToPath(new URL("../index.ts", import.meta.url))], {
         cwd: fileURLToPath(new URL("../../", import.meta.url)),
-        env: { ...process.env, PORT: String(port), LLM_PRECOMPUTED: "true", NORMALIZED_EVENTS_DIR: root, DASHBOARD_ORIGIN: "http://localhost:5173", REDIS_URL: "redis://127.0.0.1:1" },
+        env: { ...process.env, ...auth.env, PORT: String(port), LLM_PRECOMPUTED: "true", NORMALIZED_EVENTS_DIR: root, DASHBOARD_ORIGIN: "http://localhost:5173", REDIS_URL: "redis://127.0.0.1:1" },
         stdio: ["ignore", "pipe", "pipe"], windowsHide: true,
     });
     let output = "";
@@ -65,6 +67,7 @@ test("HTTP llm falls back before readiness, then serves exact filtered snapshots
         child.kill("SIGTERM");
         if (child.exitCode === null && child.signalCode === null) await exited;
         clearTimeout(force);
+        await auth.close();
         assert.ok(resolve(root).startsWith(resolve(tmpdir()) + (process.platform === "win32" ? "\\" : "/")));
         await rm(root, { recursive: true });
     }
