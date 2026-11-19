@@ -72,7 +72,10 @@ const server = createServer(async (request, response) => {
         if (analysis) { json(response, 200, analysis(await storage.listEvents(query, request.headers.authorization!))); return; }
         const { status, ...filters } = query;
         const events = await storage.listEvents(filters, request.headers.authorization!);
-        const runs = runSummaries(events).filter(run => !status || run.status === status)
+        const spanCounts = new Map<string, number>();
+        for (const event of events) spanCounts.set(event.runId, (spanCounts.get(event.runId) ?? 0) + 1);
+        const runs = runSummaries(events).map(run => ({ ...run, spanCount: spanCounts.get(run.runId) ?? 0 }))
+            .filter(run => !status || run.status === status)
             .sort((a, b) => b.startedAt.localeCompare(a.startedAt) || b.runId.localeCompare(a.runId));
         if (path === "/v1/telemetry/export.xlsx") {
             const ids = new Set(runs.map(run => run.runId));
