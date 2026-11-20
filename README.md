@@ -200,3 +200,5 @@ delivery is still best-effort if the process exits or the outage continues.
 Hosted AI trace analysis returns 503 until a hosted model is configured. Viewing
 traces, analytics, and Excel export work without a model. The local AI analysis
 path remains available with local Ollama.
+
+Hosted and local ingestion accept request bodies up to 500 MB (500,000,000 bytes). Larger bodies return HTTP 413. This is the application body-size cap; available host memory and upstream service limits also affect large uploads.

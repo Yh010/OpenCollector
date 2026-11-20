@@ -1,4 +1,5 @@
 import "dotenv/config";
+import { readTelemetryUpload, UploadTooLargeError } from "./telemetry/readUpload.js";
 import { Ownership, OwnershipError } from "./auth/Ownership.js";
 import { OperatorAccess } from "./auth/OperatorAccess.js";
 import { setGlobalProxyFromEnv } from "node:http";
@@ -27,7 +28,6 @@ import { parseTelemetryBatch } from "./telemetry/validateTelemetryBatch.js";
 
 const operatorAccess = new OperatorAccess(ownership, process.env.OPENCOLLECTOR_ADMIN_USER_IDS ?? "");
 const port = parsePort(process.env.PORT);
-const maxRequestBytes = 1_000_000;
 const rawEventWriter = new RawEventSegmentWriter({
     rootDirectory: resolve(process.env.RAW_EVENTS_DIR ?? "data/raw-events"),
     maxSegmentBytes: parsePositiveInteger(process.env.RAW_EVENT_SEGMENT_MAX_BYTES, 128 * 1024 * 1024),
@@ -120,7 +120,7 @@ const server = createServer(async (request, response) => {
 
     let batch;
     try {
-        const body = await readJsonBody(request, maxRequestBytes);
+        const body = await readTelemetryUpload(request);
         batch = parseTelemetryBatch(body);
 
         if (!batch) {
@@ -130,7 +130,7 @@ const server = createServer(async (request, response) => {
             return;
         }
     } catch (error) {
-        const statusCode = error instanceof RequestTooLargeError ? 413 : 400;
+        const statusCode = error instanceof UploadTooLargeError ? 413 : 400;
         response.writeHead(statusCode, { "Content-Type": "application/json" }).end(
             JSON.stringify({ error: error instanceof Error ? error.message : "Invalid request" }),
         );
@@ -339,18 +339,3 @@ function getRunId(pathname: string): string | undefined {
     const runId = decodeURIComponent(pathname.slice(prefix.length));
     return runId && !runId.includes("/") ? runId : undefined;
 }
-
-async function readJsonBody(request: import("node:http").IncomingMessage, maxBytes: number): Promise<unknown> {
-    let body = "";
-
-    for await (const chunk of request) {
-        body += chunk;
-        if (Buffer.byteLength(body) > maxBytes) {
-            throw new RequestTooLargeError(`Request body exceeds ${maxBytes} bytes`);
-        }
-    }
-
-    return JSON.parse(body);
-}
-
-class RequestTooLargeError extends Error {}

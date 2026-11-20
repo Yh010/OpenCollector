@@ -1,4 +1,5 @@
 import "dotenv/config";
+import { readTelemetryUpload, UploadTooLargeError } from "./telemetry/readUpload.js";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { setGlobalProxyFromEnv } from "node:http";
 import { getCACertificates, setDefaultCACertificates } from "node:tls";
@@ -39,7 +40,7 @@ const server = createServer(async (request, response) => {
         if (request.method === "POST" && path === "/v1/telemetry/events") {
             // Reject unauthenticated uploads before buffering their bodies.
             await ownership.identity(request.headers.authorization);
-            const batch = parseTelemetryBatch(await readBody(request));
+            const batch = parseTelemetryBatch(await readTelemetryUpload(request));
             if (!batch || batch.events.length < 1 || batch.events.length > 1000
                 || batch.events.some(event => !Number.isFinite(Date.parse(event.startedAt))
                     || !Number.isFinite(Date.parse(event.endedAt)) || Date.parse(event.endedAt) < Date.parse(event.startedAt))) {
@@ -90,7 +91,7 @@ const server = createServer(async (request, response) => {
         json(response, 200, { items, total: runs.length, limit: page.limit,
             nextCursor: remaining.length > page.limit ? encodeTraceCursor(items[items.length - 1]!, query, page.limit) : null });
     } catch (error) {
-        const status = error instanceof OwnershipError ? error.status : error instanceof InvalidTracePageError || error instanceof SyntaxError || error instanceof URIError ? 400 : 503;
+        const status = error instanceof UploadTooLargeError ? 413 : error instanceof OwnershipError ? error.status : error instanceof InvalidTracePageError || error instanceof SyntaxError || error instanceof URIError ? 400 : 503;
         json(response, status, { error: status === 503 ? "Telemetry service is unavailable. Retry shortly." : error instanceof Error ? error.message : "Invalid request" });
     }
 });
@@ -99,15 +100,6 @@ for (const signal of ["SIGINT", "SIGTERM"] as const) process.once(signal, () => 
 
 function json(response: ServerResponse, status: number, value: unknown): void {
     response.writeHead(status, { "Content-Type": "application/json" }).end(JSON.stringify(value));
-}
-async function readBody(request: IncomingMessage): Promise<unknown> {
-    const chunks: Buffer[] = []; let bytes = 0;
-    for await (const chunk of request) {
-        bytes += chunk.length;
-        if (bytes > 1_000_000) throw new OwnershipError(413, "Telemetry batch exceeds 1 MB");
-        chunks.push(Buffer.from(chunk));
-    }
-    return JSON.parse(Buffer.concat(chunks).toString("utf8"));
 }
 function parseQuery(parameters: URLSearchParams): TelemetryQuery {
     const result: TelemetryQuery = {};
